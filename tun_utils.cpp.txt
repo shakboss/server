@@ -1,0 +1,107 @@
+#include "tun_utils.hpp"
+#include "common.hpp" // For logging
+
+#include <fcntl.h>      // For open
+#include <unistd.h>     // For read, write, close
+#include <string.h>     // For memset, strcpy, strerror (though cstring is preferred in C++)
+#include <cstring>      // Modern C++ way for strerror, memset etc.
+#include <cerrno>       // For errno
+#include <sys/ioctl.h>  // For ioctl
+#include <linux/if.h>   // For struct ifreq, IFF_TUN, IFF_NO_PI
+#include <linux/if_tun.h> // For TUNSETIFF
+#include <cstdlib>      // For system()
+#include <stdexcept>    // For runtime_error
+
+int tun_alloc(std::string& if_name_out) {
+    struct ifreq ifr;
+    int fd, err;
+
+    if ((fd = open(TUN_DEV, O_RDWR)) < 0) {
+        LOG_ERROR("TUN: Cannot open " + std::string(TUN_DEV) + ": " + strerror(errno));
+        return -1;
+    }
+
+    memset(&ifr, 0, sizeof(ifr));
+
+    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+    if (!if_name_out.empty() && if_name_out.length() < IFNAMSIZ) {
+        strncpy(ifr.ifr_name, if_name_out.c_str(), IFNAMSIZ -1);
+        ifr.ifr_name[IFNAMSIZ-1] = '\0';
+    } else if (if_name_out.length() >= IFNAMSIZ) {
+        LOG_WARN("TUN: Preferred interface name '" + if_name_out + "' is too long. Letting kernel assign.");
+        // ifr.ifr_name will be empty, kernel assigns
+    }
+
+
+    if ((err = ioctl(fd, TUNSETIFF, (void *)&ifr)) < 0) {
+        LOG_ERROR("TUN: ioctl(TUNSETIFF) failed: " + std::string(strerror(errno)));
+        close(fd);
+        return err; // Return error code from ioctl
+    }
+
+    if_name_out = ifr.ifr_name;
+    LOG_INFO("TUN: Interface " + if_name_out + " created.");
+    return fd;
+}
+
+bool configure_tun_iface(const std::string& if_name, const std::string& ip_addr_with_prefix) {
+    std::string cmd;
+
+    cmd = "ip addr add " + ip_addr_with_prefix + " dev " + if_name;
+    LOG_INFO("TUN CMD: " + cmd);
+    if (system(cmd.c_str()) != 0) {
+        LOG_ERROR("TUN: Failed to set IP address for " + if_name + ". Command was: " + cmd);
+        return false;
+    }
+
+    cmd = "ip link set dev " + if_name + " up";
+    LOG_INFO("TUN CMD: " + cmd);
+    if (system(cmd.c_str()) != 0) {
+        LOG_ERROR("TUN: Failed to bring up " + if_name + ". Command was: " + cmd);
+        return false;
+    }
+
+    // Optionally set MTU
+    // cmd = "ip link set dev " + if_name + " mtu 1400";
+    // LOG_INFO("TUN CMD: " + cmd);
+    // if (system(cmd.c_str()) != 0) {
+    //     LOG_ERROR("TUN: Failed to set MTU for " + if_name + ". Command was: " + cmd);
+    //     return false; // Or just warn
+    // }
+
+    LOG_INFO("TUN: Interface " + if_name + " configured with " + ip_addr_with_prefix + " and up.");
+    return true;
+}
+
+ssize_t tun_read(int tun_fd, std::vector<uint8_t>& buffer) {
+    if (buffer.capacity() == 0) buffer.resize(2048); // Default size if empty
+    else if (buffer.capacity() < 1500) buffer.resize(std::max(buffer.capacity(), (size_t)2048)); // Ensure reasonable min size
+
+    ssize_t nread = read(tun_fd, buffer.data(), buffer.size()); // Read into current size
+    if (nread < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 0;
+        }
+        LOG_ERROR("TUN: Read error from fd " + std::to_string(tun_fd) + ": " + std::string(strerror(errno)));
+        return -1;
+    }
+    // buffer.resize(nread); // This was in the original, implies buffer is passed by value or re-used and should reflect actual read size.
+                           // If buffer is passed by reference and used for output, this is correct.
+    return nread; // Caller should use nread to know how much data is valid in the buffer
+}
+
+ssize_t tun_write(int tun_fd, const std::vector<uint8_t>& data) {
+    if (data.empty()){
+        LOG_DEBUG("TUN: Attempted to write 0 bytes. Skipping.");
+        return 0;
+    }
+    ssize_t nwrite = write(tun_fd, data.data(), data.size());
+    if (nwrite < 0) {
+        LOG_ERROR("TUN: Write error to fd " + std::to_string(tun_fd) + ": " + std::string(strerror(errno)));
+        return -1;
+    }
+    if (static_cast<size_t>(nwrite) != data.size()) {
+        LOG_WARN("TUN: Partial write. Wrote " + std::to_string(nwrite) + " of " + std::to_string(data.size()) + " bytes to fd " + std::to_string(tun_fd));
+    }
+    return nwrite;
+}
